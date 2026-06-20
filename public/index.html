@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>МАСКАРАД</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Лобби -->
+    <div id="lobby" class="screen active">
+      <div class="lobby-card">
+        <h1>🎭 МАСКАРАД</h1>
+        <p>Социальная дедукционная игра на 6–10 игроков</p>
+        <div class="form">
+          <input type="text" id="roomInput" placeholder="Код комнаты (например ABCD)" maxlength="8">
+          <input type="text" id="nameInput" placeholder="Ваше имя" maxlength="20">
+          <button id="joinBtn">Войти в комнату</button>
+        </div>
+        <div id="lobbyInfo" class="hidden">
+          <h2>Комната: <span id="roomCode"></span></h2>
+          <p>Игроков: <span id="playerCount">0</span>/10</p>
+          <ul id="playerList"></ul>
+          <button id="startBtn" class="hidden">Начать игру</button>
+          <p class="hint">Нужно минимум 6 игроков. Только создатель комнаты может начать игру.</p>
+        </div>
+        <div id="error" class="error hidden"></div>
+      </div>
+      <div class="rules">
+        <h3>Краткие правила</h3>
+        <p>Детективы ловят Вора. Воры крадут 3 реликвии. Дворецкий узнаёт роли ночью. Гости и Самозванец путают карты.</p>
+        <p>Ночь → Маскарад → Обвинение → Итог. Максимум 5 раундов.</p>
+      </div>
+    </div>
+
+    <!-- Игра -->
+    <div id="game" class="screen">
+      <div class="game-layout">
+        <div class="top-bar">
+          <div class="phase-info">
+            <span id="phaseName">Фаза</span>
+            <span id="timer" class="timer">00:00</span>
+            <span id="roundInfo">Раунд 1/5</span>
+          </div>
+          <div class="role-info">
+            <span id="myRole">Роль: —</span>
+            <span id="myGoal">Цель: —</span>
+          </div>
+        </div>
+
+        <div class="main-area">
+          <canvas id="gameCanvas" width="1000" height="700"></canvas>
+
+          <div class="side-panel">
+            <div class="panel-block">
+              <h4>Игроки</h4>
+              <ul id="gamePlayerList"></ul>
+            </div>
+            <div class="panel-block">
+              <h4>Реликвии</h4>
+              <ul id="relicList"></ul>
+            </div>
+            <div class="panel-block actions" id="actionsPanel">
+              <h4>Действия</h4>
+              <div id="actionButtons"></div>
+            </div>
+            <div class="panel-block">
+              <h4>Системный лог</h4>
+              <button id="copyLogBtn">Копировать лог</button>
+              <div id="systemLog" class="system-log"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bottom-bar">
+          <div class="chat">
+            <div id="chatMessages"></div>
+            <input type="text" id="chatInput" placeholder="Написать в чат..." maxlength="200">
+            <button id="chatBtn">Отправить</button>
+          </div>
+          <div class="help">
+            <p><b>WASD / Стрелки</b> — движение. <b>Клик по игроку</b> — действие. <b>Клик по комнате</b> — выбор цели.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Модальные окна -->
+      <div id="roleModal" class="modal hidden">
+        <div class="modal-content">
+          <h2 id="roleTitle">Ваша роль</h2>
+          <p id="roleText"></p>
+          <button class="close-modal">OK</button>
+        </div>
+      </div>
+
+      <div id="offerModal" class="modal hidden">
+        <div class="modal-content">
+          <h2>Обмен масками</h2>
+          <p id="offerText"></p>
+          <button id="acceptMask">Согласен</button>
+          <button id="declineMask">Отказываю</button>
+        </div>
+      </div>
+
+      <div id="gameOverModal" class="modal hidden">
+        <div class="modal-content">
+          <h2 id="gameOverTitle">Игра окончена</h2>
+          <p id="gameOverText"></p>
+          <button id="backToLobby">Вернуться в лобби</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
