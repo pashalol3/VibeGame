@@ -14,28 +14,46 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PORT = process.env.PORT || 3000;
 
 // ==================== GAME CONFIG ====================
+const METERS_PER_PIXEL = 0.05; // 1 px = 5 cm; 20 px = 1 meter
+const CANVAS_METERS = { width: 50, height: 35 }; // 1000px x 700px
+const CANVAS_PIXELS = {
+  width: Math.round(CANVAS_METERS.width / METERS_PER_PIXEL),
+  height: Math.round(CANVAS_METERS.height / METERS_PER_PIXEL)
+};
+
 const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 10;
 const MAX_ROUNDS = 5;
 const RELICS_TO_WIN = 3;
-const STEAL_TIME = 15; // seconds
-const NIGHT_TIME = 60;
-const MASQUERADE_TIME = 180;
-const ACCUSATION_TIME = 90;
-const RESULT_TIME = 30;
+const STEAL_TIME = process.env.STEAL_TIME ? parseInt(process.env.STEAL_TIME) : 15; // seconds
+const NIGHT_TIME = process.env.NIGHT_TIME ? parseInt(process.env.NIGHT_TIME) : 60;
+const MASQUERADE_TIME = process.env.MASQUERADE_TIME ? parseInt(process.env.MASQUERADE_TIME) : 180;
+const ACCUSATION_TIME = process.env.ACCUSATION_TIME ? parseInt(process.env.ACCUSATION_TIME) : 90;
+const RESULT_TIME = process.env.RESULT_TIME ? parseInt(process.env.RESULT_TIME) : 30;
 const SURVEILLANCE_TIME = 30;
 
-const ROOMS = [
-  { id: 0, name: 'Зал', x: 500, y: 350, r: 110, color: '#8B5A2B', relic: 'Корона', relicColor: '#FFD700' },
-  { id: 1, name: 'Библиотека', x: 220, y: 180, r: 90, color: '#5D4037', relic: 'Древний фолиант', relicColor: '#A0522D' },
-  { id: 2, name: 'Столовая', x: 780, y: 180, r: 90, color: '#795548', relic: 'Золотая чаша', relicColor: '#FFA500' },
-  { id: 3, name: 'Сад', x: 220, y: 520, r: 90, color: '#2E7D32', relic: 'Изумрудная статуэтка', relicColor: '#00FF7F' },
-  { id: 4, name: 'Хранилище', x: 780, y: 520, r: 90, color: '#455A64', relic: 'Серебряный ключ', relicColor: '#C0C0C0' }
+const VISION_RADIUS_METERS = 7; // visibility radius in meters
+const VISION_RADIUS_PIXELS = VISION_RADIUS_METERS / METERS_PER_PIXEL;
+
+const OBSTACLE_COUNT = 10;
+const OBSTACLE_RADIUS_METERS = 1.2;
+const OBSTACLE_RADIUS_PIXELS = OBSTACLE_RADIUS_METERS / METERS_PER_PIXEL;
+
+const ROOM_MIN_DISTANCE_METERS = 12;
+const ROOM_MIN_DISTANCE_PIXELS = ROOM_MIN_DISTANCE_METERS / METERS_PER_PIXEL;
+
+const ROOM_DATA = [
+  { id: 0, name: 'Зал', rMeters: 5.5, color: '#8B5A2B', relic: 'Корона', relicColor: '#FFD700' },
+  { id: 1, name: 'Библиотека', rMeters: 4.5, color: '#5D4037', relic: 'Древний фолиант', relicColor: '#A0522D' },
+  { id: 2, name: 'Столовая', rMeters: 4.5, color: '#795548', relic: 'Золотая чаша', relicColor: '#FFA500' },
+  { id: 3, name: 'Сад', rMeters: 4.5, color: '#2E7D32', relic: 'Изумрудная статуэтка', relicColor: '#00FF7F' },
+  { id: 4, name: 'Хранилище', rMeters: 4.5, color: '#455A64', relic: 'Серебряный ключ', relicColor: '#C0C0C0' }
 ];
 
-const CANVAS = { width: 1000, height: 700 };
-const PLAYER_RADIUS = 16;
-const PLAYER_SPEED = 180; // pixels per second
+const PLAYER_RADIUS_METERS = 0.8;
+const PLAYER_RADIUS_PIXELS = PLAYER_RADIUS_METERS / METERS_PER_PIXEL;
+const PLAYER_SPEED_METERS_PER_SECOND = 9; // m/s
+const PLAYER_SPEED_PIXELS_PER_SECOND = PLAYER_SPEED_METERS_PER_SECOND / METERS_PER_PIXEL;
 
 // ==================== STATE ====================
 const rooms = {}; // roomId -> gameRoom state
@@ -51,6 +69,8 @@ function createRoomState(roomId, hostId) {
     players: {},
     messages: [],
     currentRound: 1,
+    rooms: [],
+    obstacles: [],
     stolenRelics: [],
     butlerTarget: null,
     surveillance: { targetId: null, endTime: null },
@@ -63,7 +83,8 @@ function createRoomState(roomId, hostId) {
     timers: {},
     officialArrestUsed: false,
     nextRoundNoVote: new Set(),
-    penaltyRound: {}
+    penaltyRound: {},
+    lastStealEmit: 0
   };
 }
 
@@ -73,6 +94,14 @@ function shuffle(array) {
     [array[i], array[j]] = [array[j], array[i]];
   }
   return array;
+}
+
+function metersToPixels(m) {
+  return m / METERS_PER_PIXEL;
+}
+
+function pixelsToMeters(px) {
+  return px * METERS_PER_PIXEL;
 }
 
 function assignRoles(playerIds) {
@@ -94,17 +123,75 @@ function assignRoles(playerIds) {
   return assignment;
 }
 
+function generateRooms() {
+  const rooms = [];
+  const shuffled = shuffle([...ROOM_DATA]);
+  const margin = metersToPixels(4);
+  const w = CANVAS_PIXELS.width - margin * 2;
+  const h = CANVAS_PIXELS.height - margin * 2;
+
+  for (let i = 0; i < shuffled.length; i++) {
+    const data = shuffled[i];
+    let x, y, attempts = 0;
+    do {
+      x = margin + Math.random() * w;
+      y = margin + Math.random() * h;
+      attempts++;
+    } while (attempts < 200 && rooms.some(r => {
+      const dx = r.x - x;
+      const dy = r.y - y;
+      return Math.sqrt(dx * dx + dy * dy) < ROOM_MIN_DISTANCE_PIXELS;
+    }));
+    rooms.push({
+      ...data,
+      x,
+      y,
+      r: metersToPixels(data.rMeters)
+    });
+  }
+  return rooms;
+}
+
+function generateObstacles(rooms) {
+  const obstacles = [];
+  const margin = metersToPixels(3);
+  const w = CANVAS_PIXELS.width - margin * 2;
+  const h = CANVAS_PIXELS.height - margin * 2;
+
+  for (let i = 0; i < OBSTACLE_COUNT; i++) {
+    let x, y, attempts = 0;
+    do {
+      x = margin + Math.random() * w;
+      y = margin + Math.random() * h;
+      attempts++;
+    } while (attempts < 200 && (
+      rooms.some(r => {
+        const dx = r.x - x;
+        const dy = r.y - y;
+        return Math.sqrt(dx * dx + dy * dy) < r.r + OBSTACLE_RADIUS_PIXELS + metersToPixels(2);
+      }) ||
+      obstacles.some(o => {
+        const dx = o.x - x;
+        const dy = o.y - y;
+        return Math.sqrt(dx * dx + dy * dy) < OBSTACLE_RADIUS_PIXELS * 2 + metersToPixels(1);
+      })
+    ));
+    obstacles.push({ x, y, r: OBSTACLE_RADIUS_PIXELS, type: Math.floor(Math.random() * 3) });
+  }
+  return obstacles;
+}
+
 function resetPlayerPositions(room) {
   const ids = Object.keys(room.players);
   ids.forEach((id, i) => {
     const angle = (i / ids.length) * Math.PI * 2;
-    room.players[id].x = 500 + Math.cos(angle) * 40;
-    room.players[id].y = 350 + Math.sin(angle) * 40;
+    room.players[id].x = CANVAS_PIXELS.width / 2 + Math.cos(angle) * metersToPixels(3);
+    room.players[id].y = CANVAS_PIXELS.height / 2 + Math.sin(angle) * metersToPixels(3);
   });
 }
 
-function getRoomNameByPosition(x, y) {
-  for (const r of ROOMS) {
+function getRoomNameByPosition(x, y, rooms) {
+  for (const r of rooms) {
     const dx = x - r.x;
     const dy = y - r.y;
     if (Math.sqrt(dx * dx + dy * dy) < r.r) return r.id;
@@ -112,19 +199,50 @@ function getRoomNameByPosition(x, y) {
   return null;
 }
 
+function isObstacleCollision(x, y, obstacles, radius = PLAYER_RADIUS_PIXELS) {
+  for (const o of obstacles) {
+    const dx = x - o.x;
+    const dy = y - o.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < o.r + radius) return true;
+  }
+  return false;
+}
+
+function resolveObstacleCollision(x, y, obstacles, radius = PLAYER_RADIUS_PIXELS) {
+  let nx = x;
+  let ny = y;
+  for (const o of obstacles) {
+    const dx = x - o.x;
+    const dy = y - o.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = o.r + radius;
+    if (dist < minDist && dist > 0) {
+      const ratio = minDist / dist;
+      nx = o.x + dx * ratio;
+      ny = o.y + dy * ratio;
+    }
+  }
+  return { x: nx, y: ny };
+}
+
 function emitState(roomId) {
   const room = rooms[roomId];
   if (!room) return;
 
-  // Public state
+  const now = Date.now();
+  const remaining = Math.max(0, Math.ceil((room.phaseEndTime - now) / 1000));
+
   const publicState = {
     phase: room.phase,
     phaseEndTime: room.phaseEndTime,
+    remainingTime: remaining,
     round: room.currentRound,
     maxRounds: MAX_ROUNDS,
     hostId: room.hostId,
     players: {},
-    rooms: ROOMS,
+    rooms: room.rooms,
+    obstacles: room.obstacles,
     messages: room.messages.slice(-50),
     accusation: room.accusation ? {
       accuserId: room.accusation.accuserId,
@@ -140,7 +258,13 @@ function emitState(roomId) {
     lastTheftResult: room.lastTheftResult,
     gameOver: room.gameOver,
     officialArrestUsed: room.officialArrestUsed,
-    nextRoundNoVote: Array.from(room.nextRoundNoVote)
+    nextRoundNoVote: Array.from(room.nextRoundNoVote),
+    visionRadius: VISION_RADIUS_PIXELS,
+    myId: null,
+    myRole: null,
+    myOriginalRole: null,
+    myStealProgress: 0,
+    myStolenThisRound: false
   };
 
   for (const id of Object.keys(room.players)) {
@@ -152,14 +276,13 @@ function emitState(roomId) {
       y: p.y,
       color: p.color,
       role: room.gameOver ? p.currentRole : (room.phase === 'lobby' ? null : 'hidden'),
-      roomId: getRoomNameByPosition(p.x, p.y),
+      roomId: getRoomNameByPosition(p.x, p.y, room.rooms),
       canVote: !room.nextRoundNoVote.has(id),
       connected: p.connected,
       host: room.hostId === id
     };
   }
 
-  // Personal state for each socket
   for (const id of Object.keys(room.players)) {
     const socketId = room.players[id].socketId;
     const personal = {
@@ -172,8 +295,6 @@ function emitState(roomId) {
     };
     io.to(socketId).emit('state', personal);
   }
-
-  // Spectators receive the same public data via personal state; no separate publicState needed.
 }
 
 function addMessage(room, text, type = 'info') {
@@ -186,14 +307,12 @@ function startPhase(roomId, phaseName) {
   if (!room) return;
 
   room.phase = phaseName;
-  room.phaseEndTime = null;
   room.surveillance = { targetId: null, endTime: null };
   room.accusation = null;
   room.maskOffer = null;
   room.lastArrestResult = null;
   room.lastTheftResult = null;
 
-  // Clear old timers
   Object.values(room.timers).forEach(t => clearTimeout(t));
   room.timers = {};
 
@@ -202,6 +321,8 @@ function startPhase(roomId, phaseName) {
     resetPlayerPositions(room);
     resetThiefTimers(room);
     addMessage(room, `=== Ночь раунда ${room.currentRound}. Воры и Дворецкий делают выбор ===`, 'phase');
+    notifyThieves(room);
+    notifyButlers(room);
     room.phaseEndTime = Date.now() + NIGHT_TIME * 1000;
     room.timers.phase = setTimeout(() => startPhase(roomId, 'masquerade'), NIGHT_TIME * 1000);
   } else if (phaseName === 'masquerade') {
@@ -221,11 +342,26 @@ function startPhase(roomId, phaseName) {
   emitState(roomId);
 }
 
+function notifyThieves(room) {
+  for (const id of Object.keys(room.players)) {
+    if (room.players[id].currentRole === 'thief') {
+      io.to(id).emit('notify', '🌙 Выберите реликвию для кражи (клик по комнате или по списку).');
+    }
+  }
+}
+
+function notifyButlers(room) {
+  for (const id of Object.keys(room.players)) {
+    if (room.players[id].currentRole === 'butler') {
+      io.to(id).emit('notify', '🌙 Выберите игрока для проверки (клик по имени).');
+    }
+  }
+}
+
 function nextRound(roomId) {
   const room = rooms[roomId];
   if (!room) return;
   room.currentRound++;
-  // Clear penalties that expired (applied two or more rounds ago)
   for (const id of Array.from(room.nextRoundNoVote)) {
     if (room.penaltyRound[id] <= room.currentRound - 2) {
       room.nextRoundNoVote.delete(id);
@@ -255,14 +391,10 @@ function resolveRound(roomId) {
   const room = rooms[roomId];
   if (!room) return;
 
-  // Close any unresolved accusation (time ran out without majority)
   if (room.accusation && !room.accusation.closed) {
-    room.accusation.closed = true;
-    room.accusation.result = { revealed: false, timeout: true };
-    addMessage(room, 'Время обвинения вышло. Обвинение не получило большинства.', 'penalty');
+    resolveVoteIfNeeded(room, true);
   }
 
-  // Check theft result
   const thieves = Object.values(room.players).filter(p => p.currentRole === 'thief');
   let stolenThisRound = false;
   for (const t of thieves) {
@@ -284,7 +416,6 @@ function resolveRound(roomId) {
     return;
   }
 
-  // No one arrested, continue
   room.phase = 'result';
   room.phaseEndTime = Date.now() + RESULT_TIME * 1000;
   Object.values(room.timers).forEach(t => clearTimeout(t));
@@ -302,7 +433,130 @@ function resetThiefTimers(room) {
   });
 }
 
-// ==================== SOCKET.IO ====================
+function resolveVoteIfNeeded(room, isTimeout = false) {
+  if (!room.accusation || room.accusation.closed) return;
+
+  const eligible = Object.keys(room.players).filter(
+    id => !room.nextRoundNoVote.has(id) && id !== room.accusation.accuserId && id !== room.accusation.targetId
+  );
+  const eligibleCount = eligible.length;
+  const votes = Object.values(room.accusation.votes);
+  const yes = votes.filter(v => v === 'yes').length;
+  const no = votes.filter(v => v === 'no').length;
+  const allVoted = votes.length >= eligibleCount;
+  const yesMajority = eligibleCount > 0 && yes > eligibleCount / 2;
+  const noMajority = eligibleCount > 0 && no > eligibleCount / 2;
+
+  console.log('resolveVoteIfNeeded', {
+    isTimeout,
+    eligible: eligibleCount,
+    voted: votes.length,
+    yes,
+    no,
+    yesMajority,
+    noMajority,
+    allVoted
+  });
+
+  if (yesMajority) {
+    const target = room.players[room.accusation.targetId];
+    const accuser = room.players[room.accusation.accuserId];
+    room.accusation.closed = true;
+    room.accusation.result = { revealed: true, role: target.currentRole, targetName: target.name };
+    addMessage(room, `Карточка ${target.name} вскрыта! Роль: ${roleToRussian(target.currentRole)}`, 'reveal');
+    if (target.currentRole === 'thief') {
+      room.lastArrestResult = { targetId: target.id, targetName: target.name, targetRole: 'thief' };
+      endGame(room.id, 'detectives', `Вор (${target.name}) разоблачён голосованием. Победа Детективов!`);
+    } else {
+      room.nextRoundNoVote.add(accuser.id);
+      room.penaltyRound[accuser.id] = room.currentRound;
+      addMessage(room, `${accuser.name} ошибся и теряет голос в следующем раунде.`, 'penalty');
+      room.accusation.result = { revealed: true, role: target.currentRole, targetName: target.name, wrong: true };
+      endGame(room.id, 'thieves', `Невиновный ${target.name} разоблачён. Победа Воров!`);
+    }
+  } else if (noMajority) {
+    const accuser = room.players[room.accusation.accuserId];
+    room.accusation.closed = true;
+    room.accusation.result = { revealed: false };
+    addMessage(room, `Голоса против. Обвинение ${accuser ? accuser.name : ''} не прошло.`, 'penalty');
+    emitState(room.id);
+  } else if (isTimeout || allVoted) {
+    room.accusation.closed = true;
+    room.accusation.result = { revealed: false, timeout: true };
+    addMessage(room, 'Голосование не набрало большинства.', 'info');
+    emitState(room.id);
+  }
+}
+
+function roleToRussian(role) {
+  const map = {
+    detective: 'Детектив',
+    thief: 'Вор',
+    butler: 'Дворецкий',
+    impostor: 'Самозванец',
+    guest: 'Гость'
+  };
+  return map[role] || role;
+}
+
+// Game loop: check steal progress and surveillance
+setInterval(() => {
+  const now = Date.now();
+  for (const roomId of Object.keys(rooms)) {
+    const room = rooms[roomId];
+    if (room.phase !== 'masquerade' || room.gameOver) continue;
+
+    let stateDirty = false;
+    for (const id of Object.keys(room.players)) {
+      const p = room.players[id];
+      if (p.currentRole !== 'thief' || p.stolenThisRound) continue;
+      if (p.thiefTarget === null || p.thiefTarget === undefined) continue;
+      if (room.stolenRelics.includes(p.thiefTarget)) continue;
+
+      const roomPos = room.rooms.find(r => r.id === p.thiefTarget);
+      if (!roomPos) continue;
+
+      const inRoom = Math.sqrt(Math.pow(p.x - roomPos.x, 2) + Math.pow(p.y - roomPos.y, 2)) < roomPos.r;
+      const othersInRoom = Object.values(room.players).some(
+        other => other.id !== id && other.connected && Math.sqrt(Math.pow(other.x - roomPos.x, 2) + Math.pow(other.y - roomPos.y, 2)) < roomPos.r
+      );
+
+      if (inRoom && !othersInRoom) {
+        const prevProgress = p.stealProgress || 0;
+        if (!p.stealStartTime) {
+          p.stealStartTime = now;
+        }
+        p.stealProgress = Math.min(STEAL_TIME, (now - p.stealStartTime) / 1000);
+        if (Math.abs(p.stealProgress - prevProgress) >= 0.05) {
+          stateDirty = true;
+        }
+        if (p.stealProgress >= STEAL_TIME) {
+          p.stolenThisRound = true;
+          p.stealProgress = 0;
+          p.stealStartTime = null;
+          addMessage(room, `💎 Реликвия "${roomPos.relic}" украдена!`, 'theft');
+          stateDirty = true;
+        }
+      } else {
+        if (p.stealProgress > 0 || p.stealStartTime) {
+          p.stealProgress = 0;
+          p.stealStartTime = null;
+          stateDirty = true;
+        }
+      }
+    }
+
+    if (stateDirty && (!room.lastStealEmit || now - room.lastStealEmit >= 100)) {
+      room.lastStealEmit = now;
+      emitState(roomId);
+    }
+  }
+}, 100);
+
+server.listen(PORT, () => {
+  console.log(`Маскарад сервер запущен на http://localhost:${PORT}`);
+});
+
 io.on('connection', socket => {
   socket.on('joinRoom', ({ roomId, name }, cb) => {
     if (!roomId || !name) return cb({ error: 'Нужно имя и комната' });
@@ -324,8 +578,8 @@ io.on('connection', socket => {
       name,
       role: null,
       currentRole: null,
-      x: 500,
-      y: 350,
+      x: CANVAS_PIXELS.width / 2,
+      y: CANVAS_PIXELS.height / 2,
       color: colors[Object.keys(room.players).length % colors.length],
       connected: true,
       stealProgress: 0,
@@ -359,6 +613,10 @@ io.on('connection', socket => {
       room.players[id].role = roles[id];
       room.players[id].currentRole = roles[id];
     }
+
+    room.rooms = generateRooms();
+    room.obstacles = generateObstacles(room.rooms);
+
     resetPlayerPositions(room);
     resetThiefTimers(room);
     room.currentRound = 1;
@@ -368,7 +626,6 @@ io.on('connection', socket => {
     room.officialArrestUsed = false;
     room.gameOver = null;
 
-    // Send role info privately
     for (const id of Object.keys(room.players)) {
       const roleName = roleToRussian(room.players[id].role);
       io.to(id).emit('roleInfo', { role: room.players[id].role, text: `Ваша роль: ${roleName}` });
@@ -380,12 +637,23 @@ io.on('connection', socket => {
   socket.on('thiefSelectRelic', ({ relicId }) => {
     const roomId = socketToRoom[socket.id];
     const room = rooms[roomId];
-    if (!room || room.phase !== 'night') return;
+    if (!room || (room.phase !== 'night' && room.phase !== 'masquerade')) return;
     const p = room.players[socket.id];
     if (!p || p.currentRole !== 'thief') return;
-    if (room.stolenRelics.includes(relicId)) return;
+    if (room.stolenRelics.includes(relicId)) {
+      socket.emit('errorMessage', 'Эта реликвия уже украдена');
+      return;
+    }
+    if (p.stolenThisRound) {
+      socket.emit('errorMessage', 'Вы уже украли реликвию в этом раунде');
+      return;
+    }
+    if (room.phase === 'masquerade' && p.thiefTarget !== null && p.thiefTarget !== undefined) {
+      socket.emit('errorMessage', 'Цель для кражи уже выбрана в этом раунде');
+      return;
+    }
     p.thiefTarget = relicId;
-    io.to(socket.id).emit('notify', `Вы выбрали: ${ROOMS[relicId].relic} (${ROOMS[relicId].name})`);
+    io.to(socket.id).emit('notify', `✅ Вы выбрали цель: ${room.rooms.find(r => r.id === relicId)?.relic || '???'}. Ждите фазы Маскарад.`);
     emitState(roomId);
   });
 
@@ -398,7 +666,8 @@ io.on('connection', socket => {
     if (!room.players[targetId]) return;
     room.butlerTarget = targetId;
     const target = room.players[targetId];
-    io.to(socket.id).emit('notify', `${target.name} — ${roleToRussian(target.currentRole)}`);
+    addMessage(room, `🦉 Дворецкий узнал роль ${target.name}: ${roleToRussian(target.currentRole)}`, 'reveal');
+    io.to(socket.id).emit('notify', `🦉 Вы узнали роль ${target.name}: ${roleToRussian(target.currentRole)}. Игроки этого не видят.`);
     emitState(roomId);
   });
 
@@ -409,8 +678,17 @@ io.on('connection', socket => {
     const player = room.players[socket.id];
     if (!player || room.gameOver) return;
 
-    player.x = Math.max(PLAYER_RADIUS, Math.min(CANVAS.width - PLAYER_RADIUS, x));
-    player.y = Math.max(PLAYER_RADIUS, Math.min(CANVAS.height - PLAYER_RADIUS, y));
+    let nx = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.width - PLAYER_RADIUS_PIXELS, x));
+    let ny = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.height - PLAYER_RADIUS_PIXELS, y));
+
+    if (isObstacleCollision(nx, ny, room.obstacles, PLAYER_RADIUS_PIXELS)) {
+      const resolved = resolveObstacleCollision(nx, ny, room.obstacles, PLAYER_RADIUS_PIXELS);
+      nx = resolved.x;
+      ny = resolved.y;
+    }
+
+    player.x = nx;
+    player.y = ny;
 
     const now = Date.now();
     if (!player.lastEmitTime || now - player.lastEmitTime >= 30) {
@@ -438,33 +716,21 @@ io.on('connection', socket => {
   });
 
   socket.on('offerMask', ({ targetId }) => {
-    console.log('offerMask received', { from: socket.id, targetId });
     const roomId = socketToRoom[socket.id];
     const room = rooms[roomId];
-    if (!room || room.phase !== 'masquerade') {
-      console.log('offerMask rejected: wrong phase', room ? room.phase : 'no room');
-      return;
-    }
+    if (!room || room.phase !== 'masquerade') return;
     const from = room.players[socket.id];
     const to = room.players[targetId];
-    if (!from || !to) {
-      console.log('offerMask rejected: missing player', { from: !!from, to: !!to });
-      return;
-    }
-    if (room.maskOffer) {
-      console.log('offerMask rejected: existing offer', room.maskOffer);
-      return;
-    }
+    if (!from || !to) return;
+    if (room.maskOffer) return;
     const dx = from.x - to.x;
     const dy = from.y - to.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    console.log('offerMask distance', dist);
-    // Distance check relaxed for testing; will re-enable later if needed.
-    if (dist > 200) {
+    if (dist > metersToPixels(10)) {
       socket.emit('errorMessage', 'Подойдите ближе для обмена масками');
       return;
     }
-    room.maskOffer = { fromId: socket.id, toId: targetId };
+    room.maskOffer = { fromId: socket.id, toId: targetId, fromName: from.name };
     addMessage(room, `${from.name} предложил обмен масками ${to.name}`, 'action');
     emitState(roomId);
   });
@@ -478,9 +744,45 @@ io.on('connection', socket => {
     const to = room.players[room.maskOffer.toId];
     if (!from || !to) return;
     if (accept) {
+      const fromWasThief = from.currentRole === 'thief';
+      const toWasThief = to.currentRole === 'thief';
+      const fromThiefState = {
+        thiefTarget: from.thiefTarget,
+        stealProgress: from.stealProgress,
+        stealStartTime: from.stealStartTime,
+        stolenThisRound: from.stolenThisRound
+      };
+      const toThiefState = {
+        thiefTarget: to.thiefTarget,
+        stealProgress: to.stealProgress,
+        stealStartTime: to.stealStartTime,
+        stolenThisRound: to.stolenThisRound
+      };
+
       const temp = from.currentRole;
       from.currentRole = to.currentRole;
       to.currentRole = temp;
+
+      if (fromWasThief && to.currentRole === 'thief') {
+        to.thiefTarget = fromThiefState.thiefTarget;
+        to.stealProgress = fromThiefState.stealProgress;
+        to.stealStartTime = fromThiefState.stealStartTime;
+        to.stolenThisRound = fromThiefState.stolenThisRound;
+        from.thiefTarget = null;
+        from.stealProgress = 0;
+        from.stealStartTime = null;
+        from.stolenThisRound = false;
+      } else if (toWasThief && from.currentRole === 'thief') {
+        from.thiefTarget = toThiefState.thiefTarget;
+        from.stealProgress = toThiefState.stealProgress;
+        from.stealStartTime = toThiefState.stealStartTime;
+        from.stolenThisRound = toThiefState.stolenThisRound;
+        to.thiefTarget = null;
+        to.stealProgress = 0;
+        to.stealStartTime = null;
+        to.stolenThisRound = false;
+      }
+
       addMessage(room, `✅ ${from.name} и ${to.name} обменялись масками!`, 'action');
       io.to(from.id).emit('notify', `Вы теперь ${roleToRussian(from.currentRole)}`);
       io.to(to.id).emit('notify', `Вы теперь ${roleToRussian(to.currentRole)}`);
@@ -496,7 +798,7 @@ io.on('connection', socket => {
     const room = rooms[roomId];
     if (!room || room.phase !== 'accusation') return;
     if (room.accusation && room.accusation.closed) return;
-    if (room.accusation) return; // one accusation at a time
+    if (room.accusation) return;
     const accuser = room.players[socket.id];
     const target = room.players[targetId];
     if (!accuser || !target) return;
@@ -564,7 +866,6 @@ io.on('connection', socket => {
       room.players[socket.id].connected = false;
       addMessage(room, `${room.players[socket.id].name} отключился`, 'leave');
       emitState(roomId);
-      // Optionally remove from lobby
       if (room.phase === 'lobby') {
         delete room.players[socket.id];
       }
@@ -575,94 +876,4 @@ io.on('connection', socket => {
     }
     delete socketToRoom[socket.id];
   });
-});
-
-function resolveVoteIfNeeded(room) {
-  if (!room.accusation || room.accusation.closed) return;
-  const eligible = Object.keys(room.players).filter(
-    id => !room.nextRoundNoVote.has(id) && id !== room.accusation.accuserId && id !== room.accusation.targetId
-  );
-  const voted = Object.keys(room.accusation.votes);
-  if (voted.length >= eligible.length && eligible.length > 0) {
-    // All eligible voted
-    const yes = Object.values(room.accusation.votes).filter(v => v === 'yes').length;
-    const no = Object.values(room.accusation.votes).filter(v => v === 'no').length;
-    const target = room.players[room.accusation.targetId];
-    const accuser = room.players[room.accusation.accuserId];
-    if (yes > no) {
-      // Reveal
-      room.accusation.closed = true;
-      room.accusation.result = { revealed: true, role: target.currentRole, targetName: target.name };
-      addMessage(room, `Карточка ${target.name} вскрыта! Роль: ${roleToRussian(target.currentRole)}`, 'reveal');
-      if (target.currentRole === 'thief') {
-        room.lastArrestResult = { targetId: target.id, targetName: target.name, targetRole: 'thief' };
-        endGame(room.id, 'detectives', `Вор (${target.name}) разоблачён голосованием. Победа Детективов!`);
-      } else {
-        room.nextRoundNoVote.add(accuser.id);
-        room.penaltyRound[accuser.id] = room.currentRound;
-        addMessage(room, `${accuser.name} ошибся и теряет голос в следующем раунде.`, 'penalty');
-        room.accusation.closed = true;
-        room.accusation.result = { revealed: true, role: target.currentRole, targetName: target.name, wrong: true };
-        emitState(room.id);
-      }
-    } else if (no > 0) {
-      // Not enough votes, close without reveal
-      room.accusation.closed = true;
-      room.accusation.result = { revealed: false };
-      addMessage(room, `Голоса против. Обвинение ${accuser.name} не прошло.`, 'penalty');
-      emitState(room.id);
-    }
-  }
-}
-
-function roleToRussian(role) {
-  const map = {
-    detective: 'Детектив',
-    thief: 'Вор',
-    butler: 'Дворецкий',
-    impostor: 'Самозванец',
-    guest: 'Гость'
-  };
-  return map[role] || role;
-}
-
-// Game loop: check steal progress and surveillance
-setInterval(() => {
-  const now = Date.now();
-  for (const roomId of Object.keys(rooms)) {
-    const room = rooms[roomId];
-    if (room.phase !== 'masquerade' || room.gameOver) continue;
-
-    for (const id of Object.keys(room.players)) {
-      const p = room.players[id];
-      if (p.currentRole !== 'thief' || p.stolenThisRound) continue;
-      if (p.thiefTarget === null || p.thiefTarget === undefined) continue;
-      if (room.stolenRelics.includes(p.thiefTarget)) continue;
-
-      const roomPos = ROOMS[p.thiefTarget];
-      const inRoom = Math.sqrt(Math.pow(p.x - roomPos.x, 2) + Math.pow(p.y - roomPos.y, 2)) < roomPos.r;
-      const othersInRoom = Object.values(room.players).some(
-        other => other.id !== id && other.connected && Math.sqrt(Math.pow(other.x - roomPos.x, 2) + Math.pow(other.y - roomPos.y, 2)) < roomPos.r
-      );
-
-      if (inRoom && !othersInRoom) {
-        if (!p.stealStartTime) {
-          p.stealStartTime = now;
-        }
-        p.stealProgress = Math.min(STEAL_TIME, (now - p.stealStartTime) / 1000);
-        if (p.stealProgress >= STEAL_TIME) {
-          p.stolenThisRound = true;
-          addMessage(room, `💎 ${p.name} украл реликвию "${roomPos.relic}"!`, 'theft');
-          emitState(roomId);
-        }
-      } else {
-        p.stealProgress = 0;
-        p.stealStartTime = null;
-      }
-    }
-  }
-}, 100);
-
-server.listen(PORT, () => {
-  console.log(`Маскарад сервер запущен на http://localhost:${PORT}`);
 });

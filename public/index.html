@@ -49,39 +49,44 @@
           </div>
         </div>
 
-        <div class="main-area">
-          <canvas id="gameCanvas" width="1000" height="700"></canvas>
+        <div class="game-body">
+          <div class="canvas-wrapper">
+            <canvas id="gameCanvas" width="1000" height="700" data-width-meters="50" data-height-meters="35"></canvas>
+          </div>
 
-          <div class="side-panel">
-            <div class="panel-block">
+          <div class="right-sidebar">
+            <div class="sidebar-section players">
               <h4>Игроки</h4>
               <ul id="gamePlayerList"></ul>
             </div>
-            <div class="panel-block">
+            <div class="sidebar-section relics">
               <h4>Реликвии</h4>
               <ul id="relicList"></ul>
             </div>
-            <div class="panel-block actions" id="actionsPanel">
+            <div class="sidebar-section actions" id="actionsPanel">
               <h4>Действия</h4>
               <div id="actionButtons"></div>
             </div>
-            <div class="panel-block">
-              <h4>Системный лог</h4>
-              <button id="copyLogBtn">Копировать лог</button>
-              <div id="systemLog" class="system-log"></div>
+            <div class="sidebar-section chat">
+              <h4>Чат</h4>
+              <div id="chatMessages"></div>
+              <div class="chat-input-row">
+                <input type="text" id="chatInput" placeholder="Написать в чат..." maxlength="200">
+                <button id="chatBtn">➤</button>
+              </div>
+            </div>
+            <div class="sidebar-section log-collapsible">
+              <button id="toggleLogBtn" class="toggle-btn">Показать системный лог</button>
+              <div id="systemLogWrapper" class="hidden">
+                <button id="copyLogBtn">Копировать лог</button>
+                <div id="systemLog" class="system-log"></div>
+              </div>
             </div>
           </div>
         </div>
 
-        <div class="bottom-bar">
-          <div class="chat">
-            <div id="chatMessages"></div>
-            <input type="text" id="chatInput" placeholder="Написать в чат..." maxlength="200">
-            <button id="chatBtn">Отправить</button>
-          </div>
-          <div class="help">
-            <p><b>WASD / Стрелки</b> — движение. <b>Клик по игроку</b> — действие. <b>Клик по комнате</b> — выбор цели.</p>
-          </div>
+        <div class="bottom-bar help-bar">
+          <p><b>WASD / Стрелки</b> — движение. <b>Клик по игроку</b> — действие. <b>Клик по комнате</b> — выбор цели.</p>
         </div>
       </div>
 
@@ -91,6 +96,14 @@
           <h2 id="roleTitle">Ваша роль</h2>
           <p id="roleText"></p>
           <button class="close-modal">OK</button>
+        </div>
+      </div>
+
+      <div id="roundActionModal" class="modal hidden">
+        <div class="modal-content">
+          <h2 id="roundActionTitle">Раунд 1</h2>
+          <p id="roundActionText"></p>
+          <button id="roundActionClose">Понятно</button>
         </div>
       </div>
 
