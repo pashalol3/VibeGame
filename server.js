@@ -35,9 +35,11 @@ const SURVEILLANCE_TIME = 30;
 const VISION_RADIUS_METERS = 7; // visibility radius in meters
 const VISION_RADIUS_PIXELS = VISION_RADIUS_METERS / METERS_PER_PIXEL;
 
-const OBSTACLE_COUNT = 10;
-const OBSTACLE_RADIUS_METERS = 1.2;
-const OBSTACLE_RADIUS_PIXELS = OBSTACLE_RADIUS_METERS / METERS_PER_PIXEL;
+const OBSTACLE_COUNT = 20;
+const WALL_THICKNESS_METERS_MIN = 1.0;
+const WALL_THICKNESS_METERS_MAX = 1.6;
+const WALL_LENGTH_METERS_MIN = 3.5;
+const WALL_LENGTH_METERS_MAX = 9.0;
 
 const ROOM_MIN_DISTANCE_METERS = 12;
 const ROOM_MIN_DISTANCE_PIXELS = ROOM_MIN_DISTANCE_METERS / METERS_PER_PIXEL;
@@ -106,13 +108,11 @@ function pixelsToMeters(px) {
 
 function assignRoles(playerIds) {
   const n = playerIds.length;
-  const detectiveCount = n >= 8 ? 2 : 1;
-  const thiefCount = n >= 8 ? 2 : 1;
   const roles = [];
-  for (let i = 0; i < detectiveCount; i++) roles.push('detective');
-  for (let i = 0; i < thiefCount; i++) roles.push('thief');
-  roles.push('butler');
-  roles.push('impostor');
+  // core roles
+  roles.push('detective', 'thief');
+  if (n > 2) roles.push('butler');
+  if (n >= 6) roles.push('impostor');
   while (roles.length < n) roles.push('guest');
   shuffle(roles);
 
@@ -152,31 +152,53 @@ function generateRooms() {
   return rooms;
 }
 
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function circleRectOverlap(cx, cy, cr, rx, ry, rw, rh) {
+  const closestX = clamp(cx, rx, rx + rw);
+  const closestY = clamp(cy, ry, ry + rh);
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  return dx * dx + dy * dy < cr * cr;
+}
+
+function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2, spacing = 0) {
+  return x1 < x2 + w2 + spacing && x1 + w1 + spacing > x2 &&
+         y1 < y2 + h2 + spacing && y1 + h1 + spacing > y2;
+}
+
 function generateObstacles(rooms) {
   const obstacles = [];
-  const margin = metersToPixels(3);
-  const w = CANVAS_PIXELS.width - margin * 2;
-  const h = CANVAS_PIXELS.height - margin * 2;
+  const margin = metersToPixels(2.5);
+  const centerX = CANVAS_PIXELS.width / 2;
+  const centerY = CANVAS_PIXELS.height / 2;
+  const roomBuffer = metersToPixels(2.5);
+  const centerBuffer = metersToPixels(5.0);
+  const wallSpacing = metersToPixels(0.8);
 
   for (let i = 0; i < OBSTACLE_COUNT; i++) {
-    let x, y, attempts = 0;
+    let x, y, w, h, attempts = 0;
+    let ok = false;
     do {
-      x = margin + Math.random() * w;
-      y = margin + Math.random() * h;
+      const vertical = Math.random() < 0.5;
+      const lengthM = WALL_LENGTH_METERS_MIN + Math.random() * (WALL_LENGTH_METERS_MAX - WALL_LENGTH_METERS_MIN);
+      const thicknessM = WALL_THICKNESS_METERS_MIN + Math.random() * (WALL_THICKNESS_METERS_MAX - WALL_THICKNESS_METERS_MIN);
+      w = metersToPixels(vertical ? thicknessM : lengthM);
+      h = metersToPixels(vertical ? lengthM : thicknessM);
+      x = margin + Math.random() * (CANVAS_PIXELS.width - margin * 2 - w);
+      y = margin + Math.random() * (CANVAS_PIXELS.height - margin * 2 - h);
+
+      ok = !rooms.some(r => circleRectOverlap(r.x, r.y, r.r + roomBuffer, x, y, w, h)) &&
+           !circleRectOverlap(centerX, centerY, centerBuffer, x, y, w, h) &&
+           !obstacles.some(o => rectsOverlap(x, y, w, h, o.x, o.y, o.w, o.h, wallSpacing));
       attempts++;
-    } while (attempts < 200 && (
-      rooms.some(r => {
-        const dx = r.x - x;
-        const dy = r.y - y;
-        return Math.sqrt(dx * dx + dy * dy) < r.r + OBSTACLE_RADIUS_PIXELS + metersToPixels(2);
-      }) ||
-      obstacles.some(o => {
-        const dx = o.x - x;
-        const dy = o.y - y;
-        return Math.sqrt(dx * dx + dy * dy) < OBSTACLE_RADIUS_PIXELS * 2 + metersToPixels(1);
-      })
-    ));
-    obstacles.push({ x, y, r: OBSTACLE_RADIUS_PIXELS, type: Math.floor(Math.random() * 3) });
+    } while (!ok && attempts < 300);
+
+    if (ok) {
+      obstacles.push({ x, y, w, h, type: Math.floor(Math.random() * 3) });
+    }
   }
   return obstacles;
 }
@@ -201,10 +223,7 @@ function getRoomNameByPosition(x, y, rooms) {
 
 function isObstacleCollision(x, y, obstacles, radius = PLAYER_RADIUS_PIXELS) {
   for (const o of obstacles) {
-    const dx = x - o.x;
-    const dy = y - o.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < o.r + radius) return true;
+    if (circleRectOverlap(x, y, radius, o.x, o.y, o.w, o.h)) return true;
   }
   return false;
 }
@@ -212,25 +231,47 @@ function isObstacleCollision(x, y, obstacles, radius = PLAYER_RADIUS_PIXELS) {
 function resolveObstacleCollision(x, y, obstacles, radius = PLAYER_RADIUS_PIXELS) {
   let nx = x;
   let ny = y;
-  for (const o of obstacles) {
-    const dx = x - o.x;
-    const dy = y - o.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const minDist = o.r + radius;
-    if (dist < minDist && dist > 0) {
-      const ratio = minDist / dist;
-      nx = o.x + dx * ratio;
-      ny = o.y + dy * ratio;
+  for (let iter = 0; iter < 4; iter++) {
+    let moved = false;
+    for (const o of obstacles) {
+      const closestX = clamp(nx, o.x, o.x + o.w);
+      const closestY = clamp(ny, o.y, o.y + o.h);
+      const dx = nx - closestX;
+      const dy = ny - closestY;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > 0 && distSq < radius * radius) {
+        const dist = Math.sqrt(distSq);
+        const overlap = radius - dist;
+        nx += (dx / dist) * overlap;
+        ny += (dy / dist) * overlap;
+        moved = true;
+      } else if (distSq === 0) {
+        // Center is inside the rectangle: push out through the nearest edge
+        const left = nx - o.x;
+        const right = o.x + o.w - nx;
+        const top = ny - o.y;
+        const bottom = o.y + o.h - ny;
+        const min = Math.min(left, right, top, bottom);
+        if (min === left) nx -= radius;
+        else if (min === right) nx += radius;
+        else if (min === top) ny -= radius;
+        else ny += radius;
+        moved = true;
+      }
     }
+    if (!moved) break;
   }
   return { x: nx, y: ny };
 }
 
-function emitState(roomId) {
+function emitState(roomId, force = false) {
   const room = rooms[roomId];
   if (!room) return;
 
   const now = Date.now();
+  if (!force && room.lastEmit && now - room.lastEmit < 30) return;
+  room.lastEmit = now;
+
   const remaining = Math.max(0, Math.ceil((room.phaseEndTime - now) / 1000));
 
   const publicState = {
@@ -300,6 +341,7 @@ function emitState(roomId) {
 function addMessage(room, text, type = 'info') {
   room.messages.push({ text, type, time: Date.now() });
   if (room.messages.length > 100) room.messages.shift();
+  emitState(room.id, true);
 }
 
 function startPhase(roomId, phaseName) {
@@ -339,7 +381,7 @@ function startPhase(roomId, phaseName) {
     room.timers.phase = setTimeout(() => nextRound(roomId), RESULT_TIME * 1000);
   }
 
-  emitState(roomId);
+  emitState(roomId, true);
 }
 
 function notifyThieves(room) {
@@ -546,9 +588,9 @@ setInterval(() => {
       }
     }
 
-    if (stateDirty && (!room.lastStealEmit || now - room.lastStealEmit >= 100)) {
+    if (stateDirty && (!room.lastStealEmit || now - room.lastStealEmit >= 200)) {
       room.lastStealEmit = now;
-      emitState(roomId);
+      emitState(roomId, true);
     }
   }
 }, 100);

@@ -64,6 +64,8 @@ let selectedTargetId = null;
 let mousePos = { x: 0, y: 0 };
 let lastMoveTime = 0;
 let lastMoveEmit = 0;
+let lastUiUpdate = 0;
+const UI_UPDATE_INTERVAL = 250; // ms
 const MOVE_EMIT_INTERVAL = 50; // ms
 const renderedPlayers = {};
 const targetPlayers = {};
@@ -112,6 +114,53 @@ function metersToPixels(m) {
 
 function pixelsToMeters(px) {
   return px * METERS_PER_PIXEL;
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function circleRectOverlap(cx, cy, cr, rx, ry, rw, rh) {
+  const closestX = clamp(cx, rx, rx + rw);
+  const closestY = clamp(cy, ry, ry + rh);
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  return dx * dx + dy * dy < cr * cr;
+}
+
+function resolveRectCollision(x, y, rects, radius) {
+  let nx = x;
+  let ny = y;
+  for (let iter = 0; iter < 4; iter++) {
+    let moved = false;
+    for (const r of rects) {
+      const closestX = clamp(nx, r.x, r.x + r.w);
+      const closestY = clamp(ny, r.y, r.y + r.h);
+      const dx = nx - closestX;
+      const dy = ny - closestY;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > 0 && distSq < radius * radius) {
+        const dist = Math.sqrt(distSq);
+        const overlap = radius - dist;
+        nx += (dx / dist) * overlap;
+        ny += (dy / dist) * overlap;
+        moved = true;
+      } else if (distSq === 0) {
+        const left = nx - r.x;
+        const right = r.x + r.w - nx;
+        const top = ny - r.y;
+        const bottom = r.y + r.h - ny;
+        const min = Math.min(left, right, top, bottom);
+        if (min === left) nx -= radius;
+        else if (min === right) nx += radius;
+        else if (min === top) ny -= radius;
+        else ny += radius;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return { x: nx, y: ny };
 }
 
 // ==================== ASSETS ====================
@@ -632,6 +681,33 @@ function lerp(start, end, t) {
   return start + (end - start) * t;
 }
 
+let fogCanvas = null;
+let fogCtx = null;
+let fogDirty = true;
+
+function cacheFog() {
+  if (!fogCanvas) {
+    fogCanvas = document.createElement('canvas');
+    fogCanvas.width = canvas.width;
+    fogCanvas.height = canvas.height;
+    fogCtx = fogCanvas.getContext('2d');
+  }
+  fogCtx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+  fogCtx.fillRect(0, 0, canvas.width, canvas.height);
+  fogDirty = false;
+}
+
+function drawFogReveal(tctx, cx, cy, r) {
+  const grad = tctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+  grad.addColorStop(0, 'rgba(0,0,0,1)');
+  grad.addColorStop(0.85, 'rgba(0,0,0,0.6)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  tctx.fillStyle = grad;
+  tctx.beginPath();
+  tctx.arc(cx, cy, r, 0, Math.PI * 2);
+  tctx.fill();
+}
+
 // ==================== CANVAS RENDERING ====================
 const UNIT_FRAME_SIZE = 192;
 const UNIT_DISPLAY_SIZE = 84;
@@ -646,6 +722,8 @@ let backgroundDirty = true;
 
 function drawSprite(img, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight, flipX = false) {
   if (!img || !img.complete || img.naturalWidth === 0) return;
+  // visible area culling: don't draw sprites fully outside canvas
+  if (dx + dWidth < 0 || dy + dHeight < 0 || dx > canvas.width || dy > canvas.height) return;
   if (flipX) {
     ctx.save();
     ctx.translate(dx + dWidth, dy);
@@ -690,7 +768,17 @@ function drawDecorations() {
   // No bushes/rocks/trees per user request
 }
 
-function render() {
+let lastRenderFrameTime = 0;
+
+function render(now) {
+  if (!state) return;
+
+  // throttle render on background tabs / low-end devices
+  if (now - lastRenderFrameTime < 16) {
+    requestAnimationFrame(render);
+    return;
+  }
+  lastRenderFrameTime = now;
   if (!state) return;
 
   const me = state.players[myId];
@@ -738,19 +826,45 @@ function render() {
     rendered.y = lerp(rendered.y, target.y, 0.12);
   });
 
-  // Draw obstacles (natural barriers)
+  // Draw maze-like walls
   if (state.obstacles) {
+    const wallStyles = [
+      { start: '#6d4c41', end: '#3e2723', border: '#8d6e63', detail: 'rgba(0,0,0,0.2)' },
+      { start: '#757575', end: '#424242', border: '#9e9e9e', detail: 'rgba(255,255,255,0.08)' },
+      { start: '#33691e', end: '#1b5e20', border: '#558b2f', detail: 'rgba(0,0,0,0.15)' }
+    ];
     state.obstacles.forEach(o => {
-      const img = o.type === 0 ? ASSETS.terrain.wood : (o.type === 1 ? ASSETS.terrain.tool1 : ASSETS.terrain.tool2);
-      if (img && img.complete) {
-        const size = o.r * 2;
-        ctx.drawImage(img, o.x - size / 2, o.y - size / 2, size, size);
-      } else {
-        ctx.beginPath();
-        ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
-        ctx.fillStyle = '#4a4a4a';
-        ctx.fill();
+      const dist = Math.hypot((o.x + o.w / 2) - myX, (o.y + o.h / 2) - myY);
+      const maxDim = Math.max(o.w, o.h);
+      if (dist > visionRadius + maxDim) return;
+
+      const style = wallStyles[(o.type || 0) % wallStyles.length];
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(o.x + 4, o.y + 4, o.w, o.h);
+
+      const grad = ctx.createLinearGradient(o.x, o.y, o.x + o.w, o.y + o.h);
+      grad.addColorStop(0, style.start);
+      grad.addColorStop(1, style.end);
+      ctx.fillStyle = grad;
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+
+      ctx.strokeStyle = style.border;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(o.x, o.y, o.w, o.h);
+
+      ctx.strokeStyle = style.detail;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const step = 16;
+      for (let by = o.y + step; by < o.y + o.h; by += step) {
+        ctx.moveTo(o.x, by);
+        ctx.lineTo(o.x + o.w, by);
       }
+      for (let bx = o.x + step; bx < o.x + o.w; bx += step) {
+        ctx.moveTo(bx, o.y);
+        ctx.lineTo(bx, o.y + o.h);
+      }
+      ctx.stroke();
     });
   }
 
@@ -816,6 +930,10 @@ function render() {
     if (!p.connected) return;
     const rp = renderedPlayers[p.id];
     if (!rp) return;
+    if (p.id !== myId) {
+      const dist = Math.hypot(rp.x - myX, rp.y - myY);
+      if (dist > visionRadius) return;
+    }
     const px = rp.x;
     const py = rp.y;
 
@@ -854,6 +972,7 @@ function render() {
     const sx = anim.frame * UNIT_FRAME_SIZE;
     const sy = 0;
     const dSize = UNIT_DISPLAY_SIZE;
+
     drawSprite(img, sx, sy, UNIT_FRAME_SIZE, UNIT_FRAME_SIZE, px - dSize / 2, py - dSize / 2, dSize, dSize, !anim.facingRight);
 
     if (p.id === myId) {
@@ -891,69 +1010,43 @@ function render() {
 
   if (selectedTargetId && state.players[selectedTargetId] && renderedPlayers[selectedTargetId]) {
     const p = renderedPlayers[selectedTargetId];
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, metersToPixels(1.6), 0, Math.PI * 2);
-    ctx.strokeStyle = '#ffd700';
-    ctx.lineWidth = metersToPixels(0.1);
-    ctx.setLineDash([metersToPixels(0.25), metersToPixels(0.25)]);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    if (selectedTargetId === myId || Math.hypot(p.x - myX, p.y - myY) <= visionRadius) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, metersToPixels(1.6), 0, Math.PI * 2);
+      ctx.strokeStyle = '#ffd700';
+      ctx.lineWidth = metersToPixels(0.1);
+      ctx.setLineDash([metersToPixels(0.25), metersToPixels(0.25)]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
 
   // Fog of war overlay
   if (me && visionRadius > 0) {
+    if (!fogCanvas) cacheFog();
+    if (fogDirty) cacheFog();
+
+    // Use a temporary canvas for dynamic reveals so the cached base fog stays intact
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = canvas.width;
     tempCanvas.height = canvas.height;
-    const tctx = tempCanvas.getContext('2d');
+    const tmpCtx = tempCanvas.getContext('2d');
+    tmpCtx.drawImage(fogCanvas, 0, 0);
+    tmpCtx.globalCompositeOperation = 'destination-out';
 
-    tctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
-    tctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    tctx.globalCompositeOperation = 'destination-out';
-
-    const grad = tctx.createRadialGradient(myX, myY, 0, myX, myY, visionRadius);
-    grad.addColorStop(0, 'rgba(0,0,0,1)');
-    grad.addColorStop(0.85, 'rgba(0,0,0,0.6)');
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
-    tctx.fillStyle = grad;
-    tctx.beginPath();
-    tctx.arc(myX, myY, visionRadius, 0, Math.PI * 2);
-    tctx.fill();
-
-    Object.values(state.players).forEach(p => {
-      if (!p.connected || p.id === myId) return;
-      const rp = renderedPlayers[p.id];
-      if (!rp) return;
-      const dist = Math.hypot(rp.x - myX, rp.y - myY);
-      if (dist < visionRadius) {
-        const g = tctx.createRadialGradient(rp.x, rp.y, 0, rp.x, rp.y, metersToPixels(2.5));
-        g.addColorStop(0, 'rgba(0,0,0,1)');
-        g.addColorStop(1, 'rgba(0,0,0,0)');
-        tctx.fillStyle = g;
-        tctx.beginPath();
-        tctx.arc(rp.x, rp.y, metersToPixels(2.5), 0, Math.PI * 2);
-        tctx.fill();
-      }
-    });
+    drawFogReveal(tmpCtx, myX, myY, visionRadius);
 
     state.rooms.forEach(r => {
       const dist = Math.hypot(r.x - myX, r.y - myY);
       if (dist < visionRadius + r.r) {
-        const g = tctx.createRadialGradient(r.x, r.y, 0, r.x, r.y, r.r + metersToPixels(2));
-        g.addColorStop(0, 'rgba(0,0,0,1)');
-        g.addColorStop(1, 'rgba(0,0,0,0)');
-        tctx.fillStyle = g;
-        tctx.beginPath();
-        tctx.arc(r.x, r.y, r.r + metersToPixels(2), 0, Math.PI * 2);
-        tctx.fill();
+        drawFogReveal(tmpCtx, r.x, r.y, r.r + metersToPixels(2));
       }
     });
 
     ctx.drawImage(tempCanvas, 0, 0);
   }
 
-  requestAnimationFrame(render);
+  requestAnimationFrame((t) => render(t));
 }
 
 // ==================== INPUT ====================
@@ -1024,9 +1117,17 @@ function updateMovement() {
     dx /= len;
     dy /= len;
     const speed = PLAYER_SPEED_PIXELS_PER_SECOND;
-    localX = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.width - PLAYER_RADIUS_PIXELS, localX + dx * speed * dt));
-    localY = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.height - PLAYER_RADIUS_PIXELS, localY + dy * speed * dt));
+    let nx = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.width - PLAYER_RADIUS_PIXELS, localX + dx * speed * dt));
+    let ny = Math.max(PLAYER_RADIUS_PIXELS, Math.min(CANVAS_PIXELS.height - PLAYER_RADIUS_PIXELS, localY + dy * speed * dt));
 
+    if (state.obstacles && state.obstacles.length) {
+      const resolved = resolveRectCollision(nx, ny, state.obstacles, PLAYER_RADIUS_PIXELS);
+      nx = resolved.x;
+      ny = resolved.y;
+    }
+
+    localX = nx;
+    localY = ny;
     me.x = localX;
     me.y = localY;
     if (!renderedPlayers[myId]) renderedPlayers[myId] = { x: localX, y: localY };
@@ -1042,8 +1143,15 @@ function updateMovement() {
     const serverX = me.x;
     const serverY = me.y;
     if (Math.abs(localX - serverX) > 2 || Math.abs(localY - serverY) > 2) {
-      localX += (serverX - localX) * 0.1;
-      localY += (serverY - localY) * 0.1;
+      let nx = localX + (serverX - localX) * 0.1;
+      let ny = localY + (serverY - localY) * 0.1;
+      if (state.obstacles && state.obstacles.length) {
+        const resolved = resolveRectCollision(nx, ny, state.obstacles, PLAYER_RADIUS_PIXELS);
+        nx = resolved.x;
+        ny = resolved.y;
+      }
+      localX = nx;
+      localY = ny;
       me.x = localX;
       me.y = localY;
       renderedPlayers[myId].x = localX;
@@ -1070,10 +1178,13 @@ function getMousePos(evt) {
 function pickTargetAt(x, y) {
   let best = null;
   let bestDistance = Infinity;
-  if (!state || !state.players) return null;
+  if (!state || !state.players || !myId) return null;
+  const myRp = renderedPlayers[myId] || state.players[myId];
+  const visionRadius = state.visionRadius || metersToPixels(7);
   Object.values(state.players).forEach(p => {
     if (p.id === myId) return;
     const rp = renderedPlayers[p.id] || p;
+    if (myRp && Math.hypot(rp.x - myRp.x, rp.y - myRp.y) > visionRadius) return;
     const dx = x - rp.x;
     const dy = y - rp.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
@@ -1131,6 +1242,9 @@ declineMask.addEventListener('click', () => {
 
 setInterval(() => {
   if (state && state.phase !== 'lobby') {
+    const now = Date.now();
+    if (now - lastUiUpdate < UI_UPDATE_INTERVAL) return;
+    lastUiUpdate = now;
     updateGameUI();
   }
-}, 1000);
+}, 250);
